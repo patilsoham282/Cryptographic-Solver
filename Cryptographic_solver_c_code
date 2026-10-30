@@ -1,0 +1,634 @@
+/*
+ * Pico 2 Cryptographic Decoder
+ * ----------------------------------------------------------------------------
+ * A USB-serial menu-driven tool for the Raspberry Pi Pico 2 (RP2350) that:
+ *   1. Decodes Morse code heard through an analog microphone (ADC input).
+ *   2. Transmits text as Morse code using a PWM-driven buzzer.
+ *   3. Encrypts/decrypts using Base64, Caesar shift, ROTX and 64-bit RSA,
+ *      and plays every result back as Morse code on the buzzer.
+ *
+ * All user interaction happens over the USB serial console (stdio).
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include "pico/stdlib.h"     // Core Pico SDK: GPIO, sleep, timing, stdio
+#include "hardware/adc.h"    // ADC access for the microphone input
+#include "hardware/pwm.h"    // PWM access for generating the buzzer tone
+
+// --- HARDWARE PINOUTS ---
+#define ADC_PIN 26           // GPIO26 = ADC0, microphone analog input
+#define ADC_CHANNEL 0        // ADC channel that corresponds to GPIO26
+#define BUZZER_PIN 15        // GPIO15, drives the buzzer via PWM
+
+// --- MORSE DECODER TUNING (15 WPM) ---
+// All timing values are in milliseconds and are tuned for roughly 15 WPM.
+#define THRESHOLD 300        // Min peak-to-peak ADC amplitude to count as "tone present"
+#define NOISE_FILTER 20      // Tone bursts shorter than this are ignored as noise
+#define DOT_MIN 20           // Shortest tone duration accepted as a dot
+#define DOT_MAX 140          // Longest tone duration accepted as a dot
+#define DASH_MIN 150         // Shortest tone duration accepted as a dash
+#define DASH_MAX 400         // Longest tone duration accepted as a dash
+#define CHAR_SPACE 180       // Silence longer than this ends a character
+#define WORD_SPACE 450       // Silence longer than this ends a word (also used when transmitting)
+
+// --- MORSE DICTIONARY ---
+// Maps a Morse sequence string (dots and dashes) to its character.
+typedef struct {
+    const char* sequence;    // e.g. ".-" for 'A'
+    char character;          // the letter or digit it represents
+} MorseNode;
+
+// Lookup table for letters A-Z and digits 0-9 (no punctuation).
+const MorseNode morse_dict[] = {
+    {".-", 'A'}, {"-...", 'B'}, {"-.-.", 'C'}, {"-..", 'D'}, {".", 'E'},
+    {"..-.", 'F'}, {"--.", 'G'}, {"....", 'H'}, {"..", 'I'}, {".---", 'J'},
+    {"-.-", 'K'}, {".-..", 'L'}, {"--", 'M'}, {"-.", 'N'}, {"---", 'O'},
+    {".--.", 'P'}, {"--.-", 'Q'}, {".-.", 'R'}, {"...", 'S'}, {"-", 'T'},
+    {"..-", 'U'}, {"...-", 'V'}, {".--", 'W'}, {"-..-", 'X'}, {"-.--", 'Y'},
+    {"--..", 'Z'}, {".----", '1'}, {"..---", '2'}, {"...--", '3'},
+    {"....-", '4'}, {".....", '5'}, {"-....", '6'}, {"--...", '7'},
+    {"---..", '8'}, {"----.", '9'}, {"-----", '0'}
+};
+
+// Converts a Morse sequence (e.g. ".-") to its character.
+// Returns '?' if the sequence is not found in the dictionary.
+char decode_morse_char(const char* seq) {
+    for (size_t i = 0; i < sizeof(morse_dict)/sizeof(morse_dict[0]); i++) {
+        if (strcmp(morse_dict[i].sequence, seq) == 0) return morse_dict[i].character;
+    }
+    return '?';
+}
+
+// Converts a character to its Morse sequence string (case-insensitive).
+// Returns NULL if the character has no Morse mapping.
+const char* char_to_morse_seq(char c) {
+    c = toupper((unsigned char)c); // Dictionary stores uppercase letters only
+    for (size_t i = 0; i < sizeof(morse_dict)/sizeof(morse_dict[0]); i++) {
+        if (morse_dict[i].character == c) return morse_dict[i].sequence;
+    }
+    return NULL; 
+}
+
+// --- UTILITY: READ STRING WITH ESCAPE/CANCEL SUPPORT ---
+// Reads a line from the USB serial console into 'buffer' (up to max_len-1 chars).
+// Echoes typed characters and handles backspace.
+// Returns 1 on success, or 0 if the user cancelled (ESC key or a cancel keyword).
+int read_string_from_usb(char* buffer, int max_len) {
+    int i = 0;
+    while (i < max_len - 1) {
+        int c = getchar();    // Blocking read of one character from USB serial
+        
+        // Check for ESC key (ASCII 27) -> Instant Cancel
+        if (c == 27) { 
+            printf("\n[CANCELLED - Returning to Main Menu]\n");
+            return 0; 
+        }
+        // Enter key: finish the line, but ignore Enter if nothing was typed yet
+        if (c == '\n' || c == '\r') {
+            if (i > 0) break; 
+            else continue;    
+        }
+        if (c == '\b' || c == 127) { // Backspace support
+            if (i > 0) {
+                i--;
+                printf("\b \b");     // Move cursor back, overwrite with space, move back again
+            }
+            continue;
+        }
+        putchar(c);           // Echo the character so the user can see what they type
+        buffer[i++] = (char)c;
+    }
+    buffer[i] = '\0';         // Terminate the string
+    printf("\n");
+
+    // Check for cancel keywords
+    if (strcmp(buffer, ":q") == 0 || strcmp(buffer, "cancel") == 0 || strcmp(buffer, "exit") == 0) {
+        printf("[CANCELLED - Returning to Main Menu]\n");
+        return 0;
+    }
+
+    return 1; // Success
+}
+
+// --- INPUT VALIDATION HELPERS ---
+
+// Parses a signed integer, verifying that no non-numeric characters exist.
+// Returns 1 and stores the result in *val on success, 0 on invalid input.
+int parse_int(const char* str, int* val) {
+    if (str == NULL || *str == '\0') return 0;
+    char* endptr;
+    long res = strtol(str, &endptr, 10);
+    // Skip any trailing whitespace after the number
+    while (*endptr == ' ' || *endptr == '\t' || *endptr == '\n' || *endptr == '\r') endptr++;
+    if (*endptr != '\0') return 0; // Contains non-numeric letters/symbols
+    *val = (int)res;
+    return 1;
+}
+
+// Parses an unsigned 64-bit integer for RSA, verifying strict numeric format.
+// Returns 1 and stores the result in *val on success, 0 on invalid input.
+int parse_uint64(const char* str, uint64_t* val) {
+    if (str == NULL || *str == '\0') return 0;
+    char* endptr;
+    unsigned long long res = strtoull(str, &endptr, 10);
+    // Skip any trailing whitespace after the number
+    while (*endptr == ' ' || *endptr == '\t' || *endptr == '\n' || *endptr == '\r') endptr++;
+    if (*endptr != '\0') return 0; // Contains non-numeric letters/symbols
+    *val = (uint64_t)res;
+    return 1;
+}
+
+// Checks if character is valid Base64 (A-Z, a-z, 0-9, '+', '/', plus '=' padding).
+int is_valid_b64_char(char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=';
+}
+
+// --- BUZZER TONE GENERATOR ---
+// Sounds the buzzer for 'duration_ms' milliseconds, then silences it.
+void play_tone(uint32_t duration_ms) {
+    uint slice_num = pwm_gpio_to_slice_num(BUZZER_PIN);   // PWM slice that controls this pin
+    uint chan = pwm_gpio_to_channel(BUZZER_PIN);          // Channel (A/B) within that slice
+    
+    pwm_set_chan_level(slice_num, chan, 714);   // ~50% duty cycle (wrap is 1428) -> tone ON
+    sleep_ms(duration_ms);
+    pwm_set_chan_level(slice_num, chan, 0);     // 0% duty cycle -> tone OFF
+}
+
+// --- REUSABLE MORSE TRANSMITTER ---
+// Plays 'text' as Morse code on the buzzer and prints the dot/dash pattern to the console.
+// Characters with no Morse mapping are silently skipped.
+void transmit_morse_string(const char* text) {
+    printf("[Buzzer Morse Output]: ");
+
+    for (int i = 0; text[i] != '\0'; i++) {
+        char c = text[i];
+        
+        // Space between words: long pause, shown as " / " on the console
+        if (c == ' ') {
+            sleep_ms(WORD_SPACE);
+            printf(" / ");
+            continue;
+        }
+
+        const char* seq = char_to_morse_seq(c);
+        if (seq != NULL) {
+            printf("%s ", seq);
+            // Play each element of the character's sequence
+            for (int j = 0; seq[j] != '\0'; j++) {
+                if (seq[j] == '.') {
+                    play_tone(100);   // Dot = 100 ms tone
+                } else if (seq[j] == '-') {
+                    play_tone(300);   // Dash = 300 ms tone
+                }
+                sleep_ms(100);        // Gap between elements within a character
+            }
+            sleep_ms(CHAR_SPACE);     // Gap between characters
+        }
+    }
+    printf("\n");
+}
+
+// --- 64-BIT RSA MATHEMATICAL HELPERS ---
+
+// Computes (a * b) % mod without overflowing 64 bits, using the
+// "double and add" method (like binary multiplication) instead of a
+// direct multiply, which would overflow for large operands on 32-bit targets.
+uint64_t mul_mod(uint64_t a, uint64_t b, uint64_t mod) {
+    uint64_t res = 0;
+    a %= mod;
+    while (b > 0) {
+        // If the lowest bit of b is set, add 'a' to the result (mod 'mod').
+        if (b & 1) res = (mod - res > a) ? (res + a) : (res + a - mod);
+        // Double 'a' (mod 'mod') using the same overflow-safe approach
+        a = (mod - a > a) ? (a + a) : (a + a - mod);
+        b >>= 1;              // Move to the next bit of b
+    }
+    return res;
+}
+
+// Computes (base ^ exp) % mod using fast square-and-multiply exponentiation.
+// This is the core operation for both RSA encryption and decryption.
+uint64_t power_mod(uint64_t base, uint64_t exp, uint64_t mod) {
+    uint64_t res = 1;
+    base %= mod;
+    while (exp > 0) {
+        if (exp % 2 == 1) res = mul_mod(res, base, mod);  // Odd exponent: multiply result by current base
+        base = mul_mod(base, base, mod);                  // Square the base
+        exp /= 2;                                         // Halve the exponent
+    }
+    return res;
+}
+
+// --- CIPHER 1: BASE64 (ENCRYPT & DECRYPT) ---
+
+// Converts a single Base64 character to its 6-bit value (0-63).
+// Returns 0 for '=' padding or any unrecognized character.
+int b64_char_to_val(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return 0; 
+}
+
+// Interactive handler: lets the user encode text to Base64 or decode Base64 to text.
+// The result is printed and also transmitted as Morse code on the buzzer.
+void handle_base64() {
+    char input[256];          // Holds user input
+    char output[512];         // Expanded to 512 bytes to safely hold Base64 expansion
+    int out_idx = 0;          // Current write position in 'output'
+
+    printf("\n--- BASE64 ---\n");
+    printf("1. Encrypt Text to Base64\n");
+    printf("2. Decrypt Base64 to Text\n");
+    printf("(Press ESC or type ':q' at any prompt to cancel)\n");
+    printf("Select option (1-2): ");
+    
+    if (!read_string_from_usb(input, 256)) return;
+
+    // Validate that the menu choice is exactly 1 or 2
+    int sub_choice;
+    if (!parse_int(input, &sub_choice) || (sub_choice != 1 && sub_choice != 2)) {
+        printf("Error: Given input is invalid! Option must be 1 or 2.\n");
+        return;
+    }
+
+    if (sub_choice == 1) {
+        // ---- ENCODE: plain text -> Base64 ----
+        printf("Enter text to encrypt: ");
+        if (!read_string_from_usb(input, 256)) return;
+        
+        const char b64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        int len = strlen(input);
+        
+        // Process input three bytes (24 bits) at a time -> four Base64 chars (6 bits each)
+        for (int i = 0; i < len; i += 3) {
+            // Cast to (uint8_t) to prevent sign extension on non-ASCII characters
+            uint32_t val = ((uint8_t)input[i] << 16);
+            if (i + 1 < len) val |= ((uint8_t)input[i+1] << 8);
+            if (i + 2 < len) val |= (uint8_t)input[i+2];
+
+            // Extract the first two 6-bit groups (always present)
+            output[out_idx++] = b64_table[(val >> 18) & 0x3F];
+            output[out_idx++] = b64_table[(val >> 12) & 0x3F];
+            
+            // Third char, or '=' padding if only one byte remained
+            if (i + 1 < len) output[out_idx++] = b64_table[(val >> 6) & 0x3F];
+            else output[out_idx++] = '=';
+
+            // Fourth char, or '=' padding if fewer than three bytes remained
+            if (i + 2 < len) output[out_idx++] = b64_table[val & 0x3F];
+            else output[out_idx++] = '=';
+        }
+        output[out_idx] = '\0';
+        printf("-> Result: %s\n", output);
+        transmit_morse_string(output);
+
+    } else if (sub_choice == 2) {
+        // ---- DECODE: Base64 -> plain text ----
+        printf("Enter Base64 string to decrypt: ");
+        if (!read_string_from_usb(input, 256)) return;
+        int len = strlen(input);
+
+        // Validate string characters and padding length
+        for (int i = 0; i < len; i++) {
+            if (!is_valid_b64_char(input[i])) {
+                printf("Error: Given input is invalid! Contains non-Base64 characters.\n");
+                return;
+            }
+        }
+        // Valid Base64 is always padded to a multiple of 4 characters
+        if (len % 4 != 0) {
+            printf("Error: Given input is invalid! Base64 string length must be a multiple of 4.\n");
+            return;
+        }
+
+        // Process four Base64 chars (24 bits) at a time -> up to three output bytes
+        for (int i = 0; i < len; i += 4) {
+            if (input[i] == '\0') break;
+            uint32_t n = (b64_char_to_val(input[i]) << 18);                           // First 6 bits
+            if (i+1 < len) n |= (b64_char_to_val(input[i+1]) << 12);                  // Second 6 bits
+            if (i+2 < len && input[i+2] != '=') n |= (b64_char_to_val(input[i+2]) << 6);  // Third 6 bits (skip padding)
+            if (i+3 < len && input[i+3] != '=') n |= b64_char_to_val(input[i+3]);          // Fourth 6 bits (skip padding)
+            
+            // Always at least one byte; the 2nd/3rd bytes exist only if not padded
+            output[out_idx++] = (n >> 16) & 0xFF;
+            if (i + 2 < len && input[i+2] != '=') output[out_idx++] = (n >> 8) & 0xFF;
+            if (i + 3 < len && input[i+3] != '=') output[out_idx++] = n & 0xFF;
+        }
+        output[out_idx] = '\0';
+        printf("-> Result: %s\n", output);
+        transmit_morse_string(output);
+    }
+}
+
+// --- CIPHER 2 & 3: CAESAR SHIFT & ROTX (ENCRYPT & DECRYPT) ---
+// Both ciphers shift letters by a fixed amount; they share this one handler.
+// is_rotx = 0 -> Caesar shift, is_rotx = 1 -> ROTX (only the prompts differ).
+void handle_shift_ciphers(int is_rotx) {
+    char input[256];          // Menu choice, then the text to process
+    char shift_str[10];       // Shift amount typed by the user
+    int shift = 0;
+    int mode = 1;             // 1 = encrypt, 2 = decrypt
+
+    if (is_rotx) {
+        printf("\n--- ROTX ---\n");
+    } else {
+        printf("\n--- CAESAR SHIFT ---\n");
+    }
+    
+    printf("1. Encrypt Text\n");
+    printf("2. Decrypt Text\n");
+    printf("(Press ESC or type ':q' at any prompt to cancel)\n");
+    printf("Select option (1-2): ");
+    
+    if (!read_string_from_usb(input, 256)) return;
+    if (!parse_int(input, &mode) || (mode != 1 && mode != 2)) {
+        printf("Error: Given input is invalid! Option must be 1 or 2.\n");
+        return;
+    }
+
+    if (is_rotx) {
+        printf("Enter rotation amount (X): ");
+    } else {
+        printf("Enter shift amount (e.g., 3): ");
+    }
+    
+    if (!read_string_from_usb(shift_str, 10)) return;
+    if (!parse_int(shift_str, &shift)) {
+        printf("Error: Given input is invalid! Shift/Rotation amount must be a number.\n");
+        return;
+    }
+
+    printf("Enter text: ");
+    if (!read_string_from_usb(input, 256)) return;
+
+    // Normalize the shift into the range 0-25 (handles negatives and large values)
+    shift = shift % 26;
+    if (shift < 0) shift += 26;
+
+    // Decrypting is the same as shifting forward by (26 - shift)
+    if (mode == 2) {
+        shift = 26 - shift;
+    }
+
+    // Shift each letter in place, preserving case; non-letters are left unchanged
+    for (int i = 0; input[i] != '\0'; i++) {
+        char c = input[i];
+        if (c >= 'A' && c <= 'Z') {
+            c = 'A' + (c - 'A' + shift) % 26;   // Wrap around within A-Z
+        } else if (c >= 'a' && c <= 'z') {
+            c = 'a' + (c - 'a' + shift) % 26;   // Wrap around within a-z
+        }
+        input[i] = c;
+    }
+    
+    printf("-> Result: %s\n", input);
+    transmit_morse_string(input);
+}
+
+// --- CIPHER 4: 64-BIT RSA DECODER / ENCODER ---
+// Textbook RSA on integers: encrypt with C = M^e mod N, decrypt with M = C^d mod N.
+// The user supplies the key values; no key generation is done here.
+void handle_rsa() {
+    char input[256];          // Reused buffer for every prompt
+    char result_str[64];      // Result as a string (a uint64 has at most 20 digits)
+
+    printf("\n--- 64-BIT RSA ---\n");
+    printf("1. Encrypt integer message (C = M^e mod N)\n");
+    printf("2. Decrypt integer ciphertext (M = C^d mod N)\n");
+    printf("(Press ESC or type ':q' at any prompt to cancel)\n");
+    printf("Select option (1-2): ");
+    
+    if (!read_string_from_usb(input, 256)) return;
+    int sub_choice;
+    if (!parse_int(input, &sub_choice) || (sub_choice != 1 && sub_choice != 2)) {
+        printf("Error: Given input is invalid! Option must be 1 or 2.\n");
+        return;
+    }
+
+    if (sub_choice == 1) {
+        // ---- ENCRYPT: collect M, e, N then compute C = M^e mod N ----
+        printf("Enter Message integer (M < N): ");
+        if (!read_string_from_usb(input, 256)) return;
+        uint64_t m;
+        if (!parse_uint64(input, &m)) {
+            printf("Error: Given input is invalid! Message M must be a positive integer.\n");
+            return;
+        }
+
+        printf("Enter Public Key Exponent (e): ");
+        if (!read_string_from_usb(input, 256)) return;
+        uint64_t e;
+        if (!parse_uint64(input, &e)) {
+            printf("Error: Given input is invalid! Exponent e must be a positive integer.\n");
+            return;
+        }
+
+        printf("Enter Modulus (N): ");
+        if (!read_string_from_usb(input, 256)) return;
+        uint64_t n;
+        if (!parse_uint64(input, &n)) {
+            printf("Error: Given input is invalid! Modulus N must be a positive integer.\n");
+            return;
+        }
+
+        // RSA requires the message to be smaller than the modulus
+        if (n == 0 || m >= n) {
+            printf("Error: Message must be strictly less than Modulus N (and N > 0)!\n");
+            return;
+        }
+
+        uint64_t cipher = power_mod(m, e, n);
+        // PRIu64 is the portable printf format for uint64_t
+        snprintf(result_str, sizeof(result_str), "%" PRIu64, cipher);
+        printf("-> Result: %s\n", result_str);
+        transmit_morse_string(result_str);
+
+    } else if (sub_choice == 2) {
+        // ---- DECRYPT: collect C, d, N then compute M = C^d mod N ----
+        printf("Enter Ciphertext integer (C): ");
+        if (!read_string_from_usb(input, 256)) return;
+        uint64_t c;
+        if (!parse_uint64(input, &c)) {
+            printf("Error: Given input is invalid! Ciphertext C must be a positive integer.\n");
+            return;
+        }
+
+        printf("Enter Private Key Exponent (d): ");
+        if (!read_string_from_usb(input, 256)) return;
+        uint64_t d;
+        if (!parse_uint64(input, &d)) {
+            printf("Error: Given input is invalid! Exponent d must be a positive integer.\n");
+            return;
+        }
+
+        printf("Enter Modulus (N): ");
+        if (!read_string_from_usb(input, 256)) return;
+        uint64_t n;
+        if (!parse_uint64(input, &n)) {
+            printf("Error: Given input is invalid! Modulus N must be a positive integer.\n");
+            return;
+        }
+
+        // Modulus of zero would cause a divide-by-zero in the modular math
+        if (n == 0) {
+            printf("Error: Modulus N cannot be 0!\n");
+            return;
+        }
+
+        uint64_t message = power_mod(c, d, n);
+        snprintf(result_str, sizeof(result_str), "%" PRIu64, message);
+        printf("-> Result: %s\n", result_str);
+        transmit_morse_string(result_str);
+    }
+}
+
+// --- MODULE: DIRECT TEXT TO MORSE AUDIO ENCODER ---
+// Reads text from the user and plays it as Morse code on the buzzer (no encryption).
+void encode_text_to_morse() {
+    char input[256];
+    printf("\nEnter text to transmit via Morse (Press ESC or type ':q' to cancel): ");
+    if (!read_string_from_usb(input, 256)) return;
+    transmit_morse_string(input);
+    printf("[Done]\n");
+}
+
+// --- MODULE: ANALOG AUDIO MORSE DECODER ---
+// Continuously samples the microphone, detects tone on/off periods, measures
+// their durations, and converts them into dots, dashes, characters and spaces.
+// Runs until the user presses 'q' or ESC.
+void run_audio_morse_decoder() {
+    bool is_tone_active = false;                                        // Current state: tone heard or silence
+    uint32_t state_start_time = to_ms_since_boot(get_absolute_time());  // When the current state began (ms)
+    char current_sequence[10] = "";                                     // Dots/dashes of the character being received
+    int seq_idx = 0;                                                    // Number of symbols in current_sequence
+
+    printf("\n[AUDIO MODE] Listening for Morse Code...\n");
+    printf("(Press 'q' or ESC on your keyboard to exit this mode)\n\n-> ");
+
+    while (1) {
+        // Non-blocking keyboard check (timeout of 0 returns immediately) to allow exit
+        int key = getchar_timeout_us(0);
+        if (key == 'q' || key == 'Q' || key == 27) {
+            printf("\n[EXITING AUDIO MODE]\n");
+            break;
+        }
+
+        // Take 50 quick ADC samples (~5 ms window) and record the min and max.
+        // The peak-to-peak amplitude detects an AC tone regardless of DC offset.
+        uint16_t min_val = 4095;     // 12-bit ADC max
+        uint16_t max_val = 0;
+        for (int i = 0; i < 50; i++) {
+            uint16_t val = adc_read();
+            if (val < min_val) min_val = val;
+            if (val > max_val) max_val = val;
+            sleep_us(100);
+        }
+
+        uint16_t amplitude = max_val - min_val;                         // Peak-to-peak signal strength
+        uint32_t current_time = to_ms_since_boot(get_absolute_time());
+        uint32_t duration = current_time - state_start_time;            // Time spent in the current state so far
+
+        if (amplitude > THRESHOLD) {
+            // ---- Tone detected ----
+            if (!is_tone_active) {
+                // Silence -> tone transition: 'duration' is the length of the silence just ended
+                is_tone_active = true;
+                state_start_time = current_time;
+                if (duration > WORD_SPACE) {
+                    printf(" ");      // Long silence = word gap
+                }
+            }
+        } else {
+            // ---- No tone ----
+            if (is_tone_active) {
+                // Tone -> silence transition: 'duration' is the length of the tone just ended
+                is_tone_active = false;
+                state_start_time = current_time;
+
+                if (duration >= NOISE_FILTER) {          // Ignore very short blips
+                    if (duration >= DOT_MIN && duration <= DOT_MAX) {
+                        if (seq_idx < 9) current_sequence[seq_idx++] = '.';   // Short tone = dot
+                    } else if (duration >= DASH_MIN && duration <= DASH_MAX) {
+                        if (seq_idx < 9) current_sequence[seq_idx++] = '-';   // Long tone = dash
+                    }
+                    current_sequence[seq_idx] = '\0';    // Keep the sequence null-terminated
+                }
+            } else {
+                // Still silent: if the gap is long enough, the character is complete
+                if (duration > CHAR_SPACE && seq_idx > 0) {
+                    char decoded = decode_morse_char(current_sequence);
+                    printf("%c", decoded);
+                    seq_idx = 0;                  // Reset for the next character
+                    current_sequence[0] = '\0';
+                }
+            }
+        }
+    }
+}
+
+// --- MAIN MENU LOOP ---
+int main() {
+    stdio_init_all();         // Initialize USB serial (stdio)
+    
+    // Set up the ADC for the microphone input
+    adc_init();
+    adc_gpio_init(ADC_PIN);
+    adc_select_input(ADC_CHANNEL);
+
+    // Set up PWM on the buzzer pin to produce a fixed-frequency tone.
+    // Assuming the default 125 MHz system clock: 125 MHz / 125 = 1 MHz PWM clock,
+    // and a wrap of 1428 gives 1 MHz / 1429 ≈ 700 Hz. Level 0 keeps it silent for now.
+    gpio_set_function(BUZZER_PIN, GPIO_FUNC_PWM);
+    uint slice_num = pwm_gpio_to_slice_num(BUZZER_PIN);
+    pwm_set_clkdiv(slice_num, 125.0f); 
+    pwm_set_wrap(slice_num, 1428);     
+    pwm_set_chan_level(slice_num, pwm_gpio_to_channel(BUZZER_PIN), 0); 
+    pwm_set_enabled(slice_num, true);
+
+    sleep_ms(2000);           // Give the host time to open the USB serial connection
+
+    // Main menu loop: runs forever
+    while (1) {
+        printf("\n==================================\n");
+        printf("    PICO 2 CRYPTOGRAPHIC DECODER  \n");
+        printf("==================================\n");
+        printf("1. Morse Code (Listen/Decode via Mic)\n");
+        printf("2. Morse Code (Transmit via Buzzer)\n");
+        printf("3. Base64 (Encrypt / Decrypt -> Morse Audio)\n");
+        printf("4. Caesar Shift (Encrypt / Decrypt -> Morse Audio)\n");
+        printf("5. ROTX (Encrypt / Decrypt -> Morse Audio)\n");
+        printf("6. 64-bit RSA (Encrypt / Decrypt -> Morse Audio)\n");
+        printf("Select an option (1-6): ");
+
+        int choice = getchar();   // Blocking read of a single menu key
+        putchar(choice);          // Echo it back
+        printf("\n");
+
+        // Dispatch to the selected feature
+        switch (choice) {
+            case '1': run_audio_morse_decoder(); break;
+            case '2': encode_text_to_morse(); break;
+            case '3': handle_base64(); break;
+            case '4': handle_shift_ciphers(0); break;   // 0 = Caesar shift
+            case '5': handle_shift_ciphers(1); break;   // 1 = ROTX
+            case '6': handle_rsa(); break;
+            default:
+                // Ignore stray Enter keypresses; report anything else as invalid
+                if (choice != '\n' && choice != '\r') {
+                    printf("Error: Given input is invalid! Option must be between 1 and 6.\n");
+                }
+                break;
+        }
+        sleep_ms(100);        // Short pause before redisplaying the menu
+    }
+    return 0;
+}
