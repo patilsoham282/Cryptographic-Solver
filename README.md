@@ -5,7 +5,13 @@ A feature-rich, menu-driven USB-serial cryptographic and telecommunications tool
 This firmware combines analog audio signal processing (Morse code decoding), hardware-driven PWM audio transmission, and classical/modern cryptography—feeding all text transformation results directly back into audio Morse code via a buzzer.
 
 ---
+## Team members
+1. Soham Patil
+2. Neel Jadhav
+3. S.Roshan
+4. Moyukh Shaurya Ghosh
 
+---
 ## Features
 
 1. **Acoustic Morse Decoder (`ADC`)**: Continuously samples an analog microphone input, performs real-time AC peak-to-peak amplitude analysis, filters background noise, parses dot/dash durations (tuned for 15 WPM), and prints decoded characters to the serial console.
